@@ -190,6 +190,14 @@ public class Camera2Controller
 	private static ImageReader				mImageReaderJPEG;
 	private static ImageReader				mImageReaderRAW;
 	private static Surface					viewFinderSurface;
+
+	// Custom Oplus Binning Switch
+    public static final CaptureRequest.Key<Integer> OPLUS_QUAD_BINNING = 
+    new CaptureRequest.Key<>("com.oplus.quad2binning", Integer.class);
+
+    // Custom Qualcomm HFR Pipeline Configurations
+    public static final CaptureRequest.Key<int[]> QCOM_HFR_CONFIG = 
+    new CaptureRequest.Key<>("org.quic.camera2.customhfrfps.info.CustomHFRConfigurations", int[].class);
 	
 
 	public static void onCreateCamera2(Context context, ApplicationInterface app, PluginManagerInterface pluginManagerBase, Handler msgHandler)
@@ -511,42 +519,49 @@ public class Camera2Controller
 		Camera2Controller.captureFormat = captureFormat;
 	}
 
-	public static boolean createCaptureSession(List<Surface> sfl)
-	{
-		try
-		{
-			if (!captureSessionOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
-				Log.d(TAG, "Create capture session failed. Semaphore is locked");
-				return false;
-			}
-		} catch (InterruptedException e)
-		{
-			e.printStackTrace();
-			return false;
-		}
-		
-		try
-		{
-			CameraDevice camera = Camera2Controller.getCamera2();
-			if(camera == null)
-			{
-				captureSessionOpenCloseLock.release();
-				return false;
-			}
-//			Log.e(TAG, "Create capture session. Surface list size = " + sfl.size());
-			// Here, we create a CameraCaptureSession for camera preview.
-			camera.createCaptureSession(sfl, Camera2Controller.captureSessionStateCallback, null);
-		} catch (IllegalArgumentException e)
-		{
-			Log.e(TAG, "Create capture session failed. IllegalArgumentException: " + e.getMessage());
-			e.printStackTrace();
-		} catch (CameraAccessException e)
-		{
-			Log.e(TAG, "Create capture session failed. CameraAccessException: " + e.getMessage());
-			e.printStackTrace();
-		}
-		return true;
-	}
+	public static boolean createCaptureSession(List<Surface> sfl) {
+    try {
+        if (!captureSessionOpenCloseLock.tryAcquire(2500, TimeUnit.MILLISECONDS)) {
+            Log.d(TAG, "Create capture session failed. Semaphore is locked");
+            return false;
+        }
+    } catch (InterruptedException e) {
+        e.printStackTrace();
+        return false;
+    }
+    
+    try {
+        CameraDevice camera = Camera2Controller.getCamera2();
+        if (camera == null) {
+            captureSessionOpenCloseLock.release();
+            return false;
+        }
+
+        // --- DYNAMICALLY INITIALIZE HIGH-SPEED SESSION ---
+        // Verify if a video recording stream is active with an active 120fps target
+        boolean isHighSpeedIntent = (CameraController.mMediaRecorder != null); 
+        
+        if (isHighSpeedIntent) {
+            Log.d(TAG, "Initializing constrained high speed capture session for 120fps recording.");
+            camera.createConstrainedHighSpeedCaptureSession(sfl, Camera2Controller.captureSessionStateCallback, null);
+        } else {
+            Log.d(TAG, "Initializing standard camera capture session.");
+            camera.createCaptureSession(sfl, Camera2Controller.captureSessionStateCallback, null);
+        }
+        // -------------------------------------------------
+
+    } catch (IllegalArgumentException e) {
+        Log.e(TAG, "Create capture session failed. IllegalArgumentException: " + e.getMessage());
+        e.printStackTrace();
+        captureSessionOpenCloseLock.release();
+    } catch (CameraAccessException e) {
+        Log.e(TAG, "Create capture session failed. CameraAccessException: " + e.getMessage());
+        e.printStackTrace();
+        captureSessionOpenCloseLock.release();
+    }
+    
+    return true;
+}
 
 	
 //	public static void dumpCameraCharacteristics()
@@ -2084,6 +2099,22 @@ public class Camera2Controller
 		stillRequestBuilder = Camera2Controller.getInstance().camDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
 		precaptureRequestBuilder = Camera2Controller.getInstance().camDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
 		rawRequestBuilder = Camera2Controller.getInstance().camDevice.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE);
+
+		// --- INJECT CUSTOM OPLUS UNBINNED RAW SWITCH ---
+		if (format == CameraController.YUV_RAW || isRAWCapture) {
+            try {
+            // Set value to 0 to instruct the Oplus HAL to bypass the 4-to-1 pixel binning pipeline
+                stillRequestBuilder.set(OPLUS_QUAD_BINNING, 0);
+                precaptureRequestBuilder.set(OPLUS_QUAD_BINNING, 0);
+                if (isRAWCapture) {
+                    rawRequestBuilder.set(OPLUS_QUAD_BINNING, 0);
+                }
+                Log.d(TAG, "Oplus Quad Binning successfully disabled for RAW stream.");
+            } catch (IllegalArgumentException e) {
+                Log.e(TAG, "Oplus Quad Binning vendor tag rejected by hardware abstraction layer.");
+            }
+		}
+		// -----------------------------------------------
 		
 		//Set Noise reduction and Edge modes for different capture formats.
 		if (format == CameraController.YUV_RAW)
@@ -2957,6 +2988,20 @@ public class Camera2Controller
 		} else 
 		{
 			previewRequestBuilder = camDevice.createCaptureRequest(CameraDevice.TEMPLATE_RECORD);
+
+		// --- INJECT CUSTOM QUALCOMM HFR TARGETS ---
+        try {
+            // Force the proprietary high frame rate configuration into the request pipeline
+            int[] hfrConfigValues = new int[]{120}; 
+            previewRequestBuilder.set(QCOM_HFR_CONFIG, hfrConfigValues);
+        
+            // Match the framework AE target range to prevent framework conflicts
+            previewRequestBuilder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, new Range<Integer>(120, 120));
+            Log.d(TAG, "Qualcomm Custom HFR 120fps values appended to Template Record.");
+        } catch (IllegalArgumentException e) {
+            Log.e(TAG, "Qualcomm Custom HFR vendor keys missing or unrecognized.");
+        }
+        // ------------------------------------------
 		}
 		
 		if(CameraController.isOpticalStabilizationSupported())
